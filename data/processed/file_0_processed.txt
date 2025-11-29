@@ -1,0 +1,5 @@
+Confidential Document
+
+This is a test PDF for the quiz solver.
+
+The hidden password is: PDF_EXPERT
