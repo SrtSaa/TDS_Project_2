@@ -747,46 +747,129 @@ async def _extract_download_links(page, base_url: str) -> List[Dict[str, str]]:
         List of dicts with 'url' and 'text' keys
     """
     from urllib.parse import urljoin, urlparse
-    
+    import re
+
     download_links = []
-    
+
     # Data file extensions (not media)
     data_extensions = {'.csv', '.json', '.xlsx', '.xls', '.txt', '.xml', '.parquet', '.pdf'}
-    
+    # Add compressed/archive extensions for matryoshka-type puzzles
+    archive_extensions = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz'}
     # Media extensions to exclude
     media_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg',
                        '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac'}
-    
+
+    all_download_exts = data_extensions | archive_extensions
+
     try:
-        # Get all links
+        # 1) Anchor tag scan (existing behavior)
         links = await page.query_selector_all('a')
-        
         for link in links:
             href = await link.get_attribute('href')
             text = await link.inner_text()
-            
             if href:
-                # Resolve relative URLs
                 absolute_url = urljoin(base_url, href)
                 parsed = urlparse(absolute_url)
                 path_lower = parsed.path.lower()
-                
-                # Check if it's a data file (not media)
-                is_data_file = any(path_lower.endswith(ext) for ext in data_extensions)
+
+                is_data_file = any(path_lower.endswith(ext) for ext in all_download_exts)
                 is_media_file = any(path_lower.endswith(ext) for ext in media_extensions)
-                
-                logger.info(f"Link found: {absolute_url} (Data file: {is_data_file}, Media file: {is_media_file})")
-                
+
+                logger.info(f"Link found: {absolute_url} (Data/Archive: {is_data_file}, Media file: {is_media_file})")
+
                 if is_data_file and not is_media_file:
                     download_links.append({
                         'url': absolute_url,
-                        'text': text.strip() or parsed.path.split('/')[-1]
+                        'text': (text or '').strip() or parsed.path.split('/')[-1]
                     })
-                    logger.info(f"Found data file link: {absolute_url}")
-        
+                    logger.info(f"Found data/archive file link: {absolute_url}")
+
+        # 2) HTML content scan for standalone filenames (handles non-anchored references)
+        try:
+            html_content = await page.content()
+        except Exception:
+            html_content = ""
+
+        if html_content:
+            # Match relative or simple filenames with data/archive extensions appearing anywhere in HTML/code text
+            # Examples: "matryoshka.zip", "/assets/data/level14.zip", "files/dataset.csv"
+            exts_pattern = '|'.join(re.escape(ext.lstrip('.')) for ext in sorted(all_download_exts, key=len, reverse=True))
+            filename_pattern = rf'(?<![A-Za-z0-9_\-/\.])([A-Za-z0-9_\-\/\.]+\.({exts_pattern}))(?![A-Za-z0-9_\-/\.])'
+
+            matches = re.findall(filename_pattern, html_content, flags=re.IGNORECASE)
+            # matches returns tuples (full, ext); take the first element as path
+            standalone_paths = [m[0] for m in matches]
+
+            # Also scan src/href attributes in raw HTML as a backup
+            attr_pattern = rf'(?:href|src)=["\']([^"\']+\.({exts_pattern}))["\']'
+            attr_matches = re.findall(attr_pattern, html_content, flags=re.IGNORECASE)
+            standalone_paths.extend([m[0] for m in attr_matches])
+
+            # Deduplicate while preserving order
+            seen_paths = set()
+            ordered_paths = []
+            for p in standalone_paths:
+                p_clean = p.strip()
+                if not p_clean or p_clean in seen_paths:
+                    continue
+                # Ignore template literals/unrendered placeholders
+                if '${' in p_clean or '{' in p_clean or '`' in p_clean:
+                    continue
+                seen_paths.add(p_clean)
+                ordered_paths.append(p_clean)
+
+            for rel in ordered_paths:
+                absolute_url = urljoin(base_url, rel)
+                parsed = urlparse(absolute_url)
+                path_lower = parsed.path.lower()
+                # Skip media files and only keep data/archive
+                if any(path_lower.endswith(ext) for ext in media_extensions):
+                    continue
+                if any(path_lower.endswith(ext) for ext in all_download_exts):
+                    # Avoid duplicates with anchors already collected
+                    if not any(d['url'] == absolute_url for d in download_links):
+                        download_links.append({
+                            'url': absolute_url,
+                            'text': parsed.path.split('/')[-1]
+                        })
+                        logger.info(f"Found data/archive via HTML scan: {absolute_url}")
+
+        # 3) Code/pre blocks heuristic for dynamic snippets (e.g., showing path pieces)
+        # If a code/pre shows a full URL or relative path, try to include it.
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_content or "", 'html.parser')
+            for tag in soup.find_all(['code', 'pre']):
+                code_text = (tag.get_text() or '').strip()
+                if not code_text:
+                    continue
+                # Direct http(s) URLs ending with desired extensions
+                url_matches = re.findall(r'(https?://[^\s\'"]+)', code_text, re.IGNORECASE)
+                for u in url_matches:
+                    parsed = urlparse(u)
+                    path_lower = parsed.path.lower()
+                    if any(path_lower.endswith(ext) for ext in all_download_exts) and not any(path_lower.endswith(ext) for ext in media_extensions):
+                        if not any(d['url'] == u for d in download_links):
+                            download_links.append({'url': u, 'text': parsed.path.split('/')[-1]})
+                            logger.info(f"Found data/archive in code block: {u}")
+                # Relative file references inside code/pre
+                rel_matches = re.findall(r'(?<![A-Za-z0-9_\-/\.])([A-Za-z0-9_\-\/\.]+\.(?:' + exts_pattern + r'))(?![A-Za-z0-9_\-/\.])', code_text, re.IGNORECASE)
+                for rel in rel_matches:
+                    # When using groups, rel can be a tuple; take the first element if so
+                    rel_path = rel[0] if isinstance(rel, tuple) else rel
+                    absolute_url = urljoin(base_url, rel_path)
+                    parsed = urlparse(absolute_url)
+                    path_lower = parsed.path.lower()
+                    if any(path_lower.endswith(ext) for ext in all_download_exts) and not any(path_lower.endswith(ext) for ext in media_extensions):
+                        if not any(d['url'] == absolute_url for d in download_links):
+                            download_links.append({'url': absolute_url, 'text': parsed.path.split('/')[-1]})
+                            logger.info(f"Found data/archive in code/pre: {absolute_url}")
+        except Exception as e:
+            logger.debug(f"Code/pre scan skipped: {e}")
+
     except Exception as e:
         logger.error(f"Error extracting download links: {e}")
-    
+
     return download_links
 
 
