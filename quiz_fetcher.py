@@ -277,8 +277,56 @@ def extract_submit_url(page_url: str, html: str, page_text: str) -> Optional[str
     Extract submission URL using adaptive strategies
     Looks for any URL that might be related to submission
     """
+    # First: explicit detection from "Submission" section or elements with class 'submit-url'
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Strategy A: Find <code> blocks containing submit urls
+        code_tags = soup.find_all('code')
+        for code in code_tags:
+            text = (code.get_text() or '').strip()
+            # Heuristic: submission examples usually show /submit/{level} or similar
+            if 'submit' in text.lower():
+                # If the code includes a span.submit-url with dynamic replacement
+                span = code.find('span', class_='submit-url')
+                if span:
+                    # The script may replace span textContent with origin + "/submit/"
+                    span_text = (span.get_text() or '').strip()
+                    # Compose full code text (span + rest of code contents) to capture the trailing level number
+                    full_text = code.get_text().strip()
+                    # Prefer the full text if it already contains absolute URL
+                    if full_text.startswith('http'):
+                        return full_text
+                    # Otherwise, join with page origin
+                    from urllib.parse import urljoin
+                    candidate = urljoin(page_url, full_text)
+                    return candidate
+                # If no span, but code tag still contains absolute submit URL
+                if text.startswith('http') and '/submit' in text.lower():
+                    return text
+
+        # Strategy B: Find any element with 'submit-url' class directly
+        span_submit = soup.select_one('.submit-url')
+        if span_submit:
+            submit_text = (span_submit.get_text() or '').strip()
+            # May be followed by a level number outside the span (e.g., "/submit/" + "12")
+            # Try to read the enclosing code tag text for full URL
+            parent_code = span_submit.find_parent('code')
+            if parent_code:
+                full_text = (parent_code.get_text() or '').strip()
+                if full_text.startswith('http'):
+                    return full_text
+                from urllib.parse import urljoin
+                return urljoin(page_url, full_text)
+            # Fallback: join the span text to origin
+            from urllib.parse import urljoin
+            return urljoin(page_url, submit_text)
+    except Exception:
+        # Continue with generic strategies if parsing fails
+        pass
+
     potential_urls = []
-    
     # Strategy 1: Look for form action
     form_pattern = r'<form[^>]+action=["\']([^"\']+)["\']'
     for match in re.finditer(form_pattern, html, re.IGNORECASE):
@@ -313,113 +361,86 @@ def extract_submit_url(page_url: str, html: str, page_text: str) -> Optional[str
     
     # Filter out obvious non-submission URLs
     blacklist_patterns = [
-        r'cloudflare',
-        r'analytics',
-        r'beacon',
-        r'tracking',
-        r'google-analytics',
-        r'gtag',
-        r'facebook',
-        r'twitter',
-        r'linkedin',
-        r'\.js$',
-        r'\.css$',
-        r'\.jpg$',
-        r'\.jpeg$',
-        r'\.png$',
-        r'\.gif$',
-        r'\.svg$',
-        r'\.woff',
-        r'\.ttf',
-        r'\.eot',
-        r'/static/',
-        r'/assets/',
-        r'/cdn/',
-        r'/fonts/',
+        r'cloudflare', r'analytics', r'beacon', r'tracking', r'google-analytics', r'gtag',
+        r'facebook', r'twitter', r'linkedin', r'\.js$', r'\.css$', r'\.jpg$', r'\.jpeg$', r'\.png$', r'\.gif$', r'\.svg$',
+        r'\.woff', r'\.ttf', r'\.eot', r'/static/', r'/assets/', r'/cdn/', r'/fonts/',
+        # Explicitly avoid game endpoints for submission
+        r'/api/game/start', r'/api/game/move'
     ]
     
     # Score URLs based on context and keywords
     scored_urls = []
     submission_keywords = [
-        'submit', 'answer', 'response', 'api', 'post', 'send',
-        'result', 'solution', 'upload', 'endpoint', 'webhook', 'quiz', 'check'
+        'submit', 'answer', 'response', 'endpoint', 'webhook', 'quiz', 'check'
     ]
     
     for source, url in potential_urls:
-        # Skip blacklisted URLs
         url_lower = url.lower()
         if any(re.search(pattern, url_lower) for pattern in blacklist_patterns):
             continue
         
         score = 0
         
-        # Higher score for URLs mentioned in code tags or JavaScript
+        # Higher score for URLs mentioned in code tags or explicit 'submit' references
         if source == 'code_tag':
-            score += 50
+            score += 80
         elif source == 'javascript':
-            score += 60  # JavaScript URLs are often the actual API endpoints
-        elif source == 'form_action':
-            score += 40
-        
-        # Score based on submission-related keywords in URL
-        for keyword in submission_keywords:
-            if keyword in url_lower:
-                score += 20
-        
-        # Prefer API endpoints
-        if '/api/' in url_lower:
             score += 30
-        elif url_lower.endswith('/api'):
+        elif source == 'form_action':
+            score += 60
+        elif source == 'html_reference':
+            score += 20
+        elif source == 'text_reference':
             score += 15
         
-        # Prefer URLs from the same domain as the page
+        # Strong bonus if URL contains '/submit'
+        if '/submit' in url_lower:
+            score += 80
+        
+        # Bonus for submission-related keywords in URL
+        for keyword in submission_keywords:
+            if keyword in url_lower:
+                score += 15
+        
+        # Prefer URLs from same domain
         try:
             page_domain = urlparse(page_url).netloc
             url_domain = urlparse(url).netloc
             if page_domain == url_domain:
-                score += 25
+                score += 20
         except:
             pass
         
-        # Bonus for POST method indicators
-        if 'post' in url_lower or 'submit' in url_lower:
-            score += 15
-        
-        # Check surrounding context in text
+        # Contextual score boost if the surrounding text includes "Submission"
         try:
-            url_index = page_text.lower().find(url.lower())
+            url_index = page_text.lower().find(url_lower)
             if url_index > -1:
-                context_start = max(0, url_index - 100)
-                context_end = min(len(page_text), url_index + len(url) + 100)
+                context_start = max(0, url_index - 200)
+                context_end = min(len(page_text), url_index + len(url) + 200)
                 context = page_text[context_start:context_end].lower()
-                
+                if 'submission' in context:
+                    score += 40
                 for keyword in submission_keywords:
                     if keyword in context:
                         score += 10
-                        
-                # Check for HTTP method indicators
-                if 'post' in context or 'submit' in context:
-                    score += 10
+            # Boost code/pre blocks generally
+            if source in ('code_tag',):
+                score += 10
         except Exception:
             pass
         
-        # Only consider URLs with a minimum score
         if score > 0:
             scored_urls.append((score, url, source))
     
-    # Return URL with highest score
     if scored_urls:
         scored_urls.sort(reverse=True, key=lambda x: x[0])
         best_url = scored_urls[0][1]
         best_source = scored_urls[0][2]
         logger.info(f"Submit URL found (score: {scored_urls[0][0]}, source: {best_source}): {best_url}")
-        
-        # Log alternatives if available
         if len(scored_urls) > 1:
             logger.info(f"Alternative URLs found:")
-            for score, url, source in scored_urls[1:4]:  # Show top 3 alternatives
+            for score, url, source in scored_urls[1:4]:
                 logger.info(f"  - (score: {score}, source: {source}): {url}")
-        
         return best_url
     
     logger.warning("No valid submit URL found")
