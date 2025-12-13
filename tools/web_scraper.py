@@ -11,7 +11,11 @@ def get_rendered_html(url: str) -> dict:
     print("\nFetching and rendering:", url)
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # --- FIX: Add arguments to disable sandbox ---
+            browser = p.chromium.launch(
+                headless=True, 
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
             page = browser.new_page()
 
             page.goto(url, wait_until="networkidle")
@@ -22,6 +26,7 @@ def get_rendered_html(url: str) -> dict:
             # Parse images
             soup = BeautifulSoup(content, "html.parser")
             imgs = [urljoin(url, img["src"]) for img in soup.find_all("img", src=True)]
+            
             if len(content) > 300000:
                     print("Warning: HTML too large, truncating...")
                     content = content[:300000] + "... [TRUNCATED DUE TO SIZE]"
@@ -32,6 +37,6 @@ def get_rendered_html(url: str) -> dict:
             }
 
     except Exception as e:
+        # It is helpful to print the error to logs so you can see it in HF
+        print(f"DEBUG ERROR in get_rendered_html: {e}") 
         return {"error": f"Error fetching/rendering page: {str(e)}"}
-
-

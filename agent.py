@@ -18,6 +18,28 @@ load_dotenv()
 EMAIL = os.getenv("EMAIL")
 SECRET = os.getenv("SECRET")
 
+# AIPipe/OpenRouter via OpenAI-compatible client
+AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-5")
+API_KEY = os.getenv("AIPIPE_API_KEY")
+
+if not API_KEY:
+    raise RuntimeError(
+        "AIPIPE_API_KEY environment variable is not set. "
+        "Add it to your .env (e.g. AIPIPE_API_KEY=sk-...)"
+    )
+
+# Base URL should be the API root; the client will append /chat/completions
+AIPIPE_BASE_URL = os.getenv(
+    "AIPIPE_BASE_URL",
+    "https://aipipe.org/openrouter/v1",
+)
+
+# Also expose as standard OpenAI env vars (for any other code using them)
+if API_KEY:
+    os.environ["OPENAI_API_KEY"] = API_KEY
+if AIPIPE_BASE_URL:
+    os.environ["OPENAI_BASE_URL"] = AIPIPE_BASE_URL
+
 RECURSION_LIMIT = 5000
 MAX_TOKENS = 60000
 
@@ -45,9 +67,11 @@ rate_limiter = InMemoryRateLimiter(
 )
 
 llm = init_chat_model(
-    model_provider="google_genai",
-    model="gemini-2.5-flash",
-    rate_limiter=rate_limiter
+    model_provider="openai",
+    model=AIPIPE_MODEL,
+    api_key=API_KEY,            # pass key directly
+    base_url=AIPIPE_BASE_URL,   # and base URL directly
+    rate_limiter=rate_limiter,
 ).bind_tools(TOOLS)
 
 

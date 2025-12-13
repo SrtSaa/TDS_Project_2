@@ -1,7 +1,6 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # --- System deps required by Playwright browsers AND Tesseract ---
-# Added 'tesseract-ocr' to the install list
 RUN apt-get update && apt-get install -y \
     wget gnupg ca-certificates curl unzip \
     # Playwright dependencies
@@ -14,26 +13,26 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Install Playwright + Chromium ---
-RUN pip install playwright && playwright install --with-deps chromium
-
 # --- Install uv package manager ---
 RUN pip install uv
 
 # --- Copy app to container ---
 WORKDIR /app
-
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
 
-# --- Install project dependencies using uv ---
+# --- 1. Install project dependencies (creates .venv) ---
 RUN uv sync --frozen
+
+# --- 2. Activate uv environment & Install Browsers ---
+# We use 'uv run' so it uses the EXACT playwright version installed above
+# We skip '--with-deps' because you installed system deps manually above
+RUN uv run playwright install chromium
 
 # HuggingFace Spaces exposes port 7860
 EXPOSE 7860
 
 # --- Run your FastAPI app ---
-# uvicorn must be in pyproject dependencies
 CMD ["uv", "run", "main.py"]

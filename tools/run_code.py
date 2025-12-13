@@ -1,11 +1,9 @@
-from google import genai
 import subprocess
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 import os
-from google.genai import types
+
 load_dotenv()
-client = genai.Client()
 
 def strip_code_fences(code: str) -> str:
     code = code.strip()
